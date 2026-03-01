@@ -92,7 +92,7 @@ class Learner:
             print(f'--- For policy up to: {self.max_lip_policy:.3f}')
 
         self.glob_min = 0.1
-        self.N_expectation = 16
+        self.N_expectation = 1
 
         # Define vectorized functions for loss computation
         self.loss_exp_decrease_vmap = jax.vmap(self.loss_exp_decrease, in_axes=(None, None, 0, 0, 0, None), out_axes=0)
@@ -248,103 +248,78 @@ class Learner:
             #####
 
             if len(counterexamples) > 0:
+                # Certificate values in all counterexample states
                 V_cx = jnp.ravel(V_state.apply_fn(certificate_params, cx_samples))
 
                 if self.exp_certificate:
-                    f_unsafe = -1 / jnp.log(1 - probability_bound)
+                    V_decrease_cx_below_thresh = (jax.lax.stop_gradient(V_cx - mesh_loss * lip_certificate) <= jnp.log(2) - jnp.log(1 - probability_bound))
+                else:
+                    V_decrease_cx_below_thresh = (jax.lax.stop_gradient(V_cx - mesh_loss * lip_certificate) <= 2 / (1 - probability_bound))
+
+                # Add initial/unsafe state counterexample loss
+                if self.exp_certificate:
                     losses_init_cx = jnp.maximum(0, V_cx + EPS_init)
                     losses_unsafe_cx = jnp.maximum(0, - jnp.log(1 - probability_bound) - V_cx + EPS_unsafe)
-                    V_decrease_cx_below_thresh = (
-                        jax.lax.stop_gradient(V_cx - mesh_loss * lip_certificate)
-                        <= jnp.log(2) - jnp.log(1 - probability_bound)
-                    )
+                    loss_init = jnp.maximum(jnp.max(losses_init, axis=0), jnp.max(cx_bool_init * losses_init_cx, axis=0))
+                    loss_unsafe = -1 / jnp.log(1 - probability_bound) * jnp.maximum(jnp.max(losses_unsafe, axis=0), jnp.max(cx_bool_unsafe * losses_unsafe_cx, axis=0))
                 else:
-                    f_unsafe = (1 - probability_bound)
                     losses_init_cx = jnp.maximum(0, V_cx - 1 + EPS_init)
                     losses_unsafe_cx = jnp.maximum(0, 1 / (1 - probability_bound) - V_cx + EPS_unsafe)
-                    V_decrease_cx_below_thresh = (
-                        jax.lax.stop_gradient(V_cx - mesh_loss * lip_certificate)
-                        <= 2 / (1 - probability_bound)
-                    )
+                    loss_init = jnp.maximum(jnp.max(losses_init, axis=0), jnp.max(cx_bool_init * losses_init_cx, axis=0))
+                    loss_unsafe = (1 - probability_bound) * jnp.maximum(jnp.max(losses_unsafe, axis=0), jnp.max(cx_bool_unsafe * losses_unsafe_cx, axis=0))
 
-                # mean init / unsafe
-                base_init_mean = jnp.mean(losses_init, axis=0)
-                base_unsafe_mean = jnp.mean(losses_unsafe, axis=0)
-
-                num_cx_init = jnp.sum(cx_bool_init, axis=0)
-                num_cx_unsafe = jnp.sum(cx_bool_unsafe, axis=0)
-
-                cx_init_mean = jnp.sum(cx_bool_init * losses_init_cx, axis=0) / (num_cx_init + 1e-4)
-                cx_unsafe_mean = jnp.sum(cx_bool_unsafe * losses_unsafe_cx, axis=0) / (num_cx_unsafe + 1e-4)
-
-                loss_init = base_init_mean + cx_init_mean
-                loss_unsafe = f_unsafe * (base_unsafe_mean + cx_unsafe_mean)
-
-                # non-dec on counterexamples
+                # Add expected decrease loss
                 expDecr_keys_cx = jax.random.split(noise_key, (self.batch_size_counterx, self.N_expectation))
                 actions_cx = Policy_state.apply_fn(policy_params, cx_samples)
-                V_expected_cx = self.loss_exp_decrease_vmap(
-                    V_state, certificate_params, cx_samples, actions_cx, expDecr_keys_cx, probability_bound
-                )
-
+                V_expected = self.loss_exp_decrease_vmap(V_state, certificate_params, cx_samples, actions_cx,
+                                                         expDecr_keys_cx, probability_bound)
                 if self.exp_certificate:
-                    Vdiffs_cx = jnp.maximum(
-                        V_expected_cx
-                        - jnp.minimum(V_cx, jnp.log(3) - jnp.log(1 - probability_bound))
-                        + mesh_loss * (K + lip_certificate)
-                        + EPS_decrease,
-                        0
-                    )
+                    Vdiffs_cx = jnp.maximum(V_expected - jnp.minimum(V_cx, jnp.log(3) - jnp.log(1 - probability_bound)) + mesh_loss * (K + lip_certificate) + EPS_decrease, 0)
                 else:
-                    Vdiffs_cx = jnp.maximum(
-                        V_expected_cx
-                        - jnp.minimum(V_cx, 3 / (1 - probability_bound))
-                        + mesh_loss * (K + lip_certificate)
-                        + EPS_decrease,
-                        0
-                    )
-
+                    Vdiffs_cx = jnp.maximum(V_expected - jnp.minimum(V_cx, 3 / (1 - probability_bound)) + mesh_loss * (K + lip_certificate) + EPS_decrease, 0)
                 Vdiffs_cx_trim = cx_bool_decrease * V_decrease_cx_below_thresh * jnp.ravel(Vdiffs_cx)
 
-                valid_nondec_base = samples_decrease_bool_not_targetUnsafe * V_decrease_below_thresh
-                valid_nondec_cx = cx_bool_decrease * V_decrease_cx_below_thresh
-                num_nondec = jnp.sum(valid_nondec_base, axis=0) + jnp.sum(valid_nondec_cx, axis=0)
-
                 if self.loss_decr_squared:
-                    loss_nondec = expDecr_multiplier * (
-                        jnp.sqrt(
-                            (jnp.sum(Vdiffs_trim ** 2, axis=0) + jnp.sum(Vdiffs_cx_trim ** 2, axis=0))
-                            / (num_nondec + 1e-4) + 1e-4
-                        ) - 1e-2
-                    )
+                    loss_exp_decrease_mean = expDecr_multiplier * (
+                            jnp.sqrt((jnp.sum(Vdiffs_trim ** 2, axis=0) + jnp.sum(Vdiffs_cx_trim ** 2, axis=0)) \
+                                     / (jnp.sum(samples_decrease_bool_not_targetUnsafe * V_decrease_below_thresh, axis=0) + jnp.sum(cx_bool_decrease * V_decrease_cx_below_thresh,
+                                                                                                                                    axis=0) + 1e-4) + 1e-4) - 1e-2)
                 else:
-                    loss_nondec = expDecr_multiplier * (
-                        (jnp.sum(Vdiffs_trim, axis=0) + jnp.sum(Vdiffs_cx_trim, axis=0))
-                        / (num_nondec + 1e-4)
-                    )
+                    loss_exp_decrease_mean = expDecr_multiplier * (
+                            (jnp.sum(Vdiffs_trim, axis=0) + jnp.sum(Vdiffs_cx_trim, axis=0)) \
+                            / (jnp.sum(samples_decrease_bool_not_targetUnsafe * V_decrease_below_thresh, axis=0) + jnp.sum(cx_bool_decrease * V_decrease_cx_below_thresh,
+                                                                                                                           axis=0) + 1e-4))
+
+                if self.loss_decr_max:
+                    loss_exp_decrease_max = jnp.maximum(jnp.max(Vdiffs_trim), jnp.max(Vdiffs_cx_trim))
+                else:
+                    loss_exp_decrease_max = 0
 
             else:
+                # Add initial/unsafe state counterexample loss
                 if self.exp_certificate:
                     f_unsafe = -1 / jnp.log(1 - probability_bound)
+
+                    loss_init = jnp.max(losses_init, axis=0)
+                    loss_unsafe = f_unsafe * jnp.max(losses_unsafe, axis=0)
                 else:
                     f_unsafe = (1 - probability_bound)
 
-                loss_init = jnp.mean(losses_init, axis=0)
-                loss_unsafe = f_unsafe * jnp.mean(losses_unsafe, axis=0)
-
-                valid_nondec = samples_decrease_bool_not_targetUnsafe * V_decrease_below_thresh
-                num_nondec = jnp.sum(valid_nondec, axis=0)
+                    loss_init = jnp.max(losses_init, axis=0)
+                    loss_unsafe = f_unsafe * jnp.max(losses_unsafe, axis=0)
 
                 if self.loss_decr_squared:
-                    loss_nondec = expDecr_multiplier * (
-                        jnp.sqrt(
-                            jnp.sum(Vdiffs_trim ** 2, axis=0) / (num_nondec + 1e-4) + 1e-4
-                        ) - 1e-3
-                    )
+                    loss_exp_decrease_mean = expDecr_multiplier * (
+                            jnp.sqrt(jnp.sum(Vdiffs_trim ** 2, axis=0) / (jnp.sum(samples_decrease_bool_not_targetUnsafe * V_decrease_below_thresh, axis=0) + 1e-4) + 1e-4) - 1e-3)
                 else:
-                    loss_nondec = expDecr_multiplier * (
-                        jnp.sum(Vdiffs_trim, axis=0) / (num_nondec + 1e-4)
-                    )
+                    loss_exp_decrease_mean = expDecr_multiplier * (
+                            jnp.sum(Vdiffs_trim, axis=0) / (jnp.sum(samples_decrease_bool_not_targetUnsafe * V_decrease_below_thresh, axis=0) + 1e-4))
+
+                if self.loss_decr_max:
+                    loss_exp_decrease_max = jnp.max(Vdiffs_trim)
+                else:
+                    loss_exp_decrease_max = 0
+
             #####
 
             # Loss to promote low Lipschitz constant
@@ -358,14 +333,15 @@ class Learner:
             loss_aux = self.auxiliary_loss * (loss_min_target + loss_min_init + loss_min_unsafe)
 
             # Define total loss
-            loss_total = loss_init + loss_unsafe + loss_nondec + loss_lipschitz + loss_aux
+            loss_total = (loss_init + loss_unsafe + loss_exp_decrease_mean + loss_exp_decrease_max + loss_lipschitz + loss_aux)
 
             infos = {
                 '0. total': loss_total,
                 '1. init': loss_init,
                 '2. unsafe': loss_unsafe,
-                '3. nondec': loss_nondec,
-                '4. loss_lipschitz': loss_lipschitz,
+                '3. expDecrease_mean': loss_exp_decrease_mean,
+                '4. expDecrease_max': loss_exp_decrease_max,
+                '5. loss_lipschitz': loss_lipschitz,
             }
 
             if self.auxiliary_loss > 0:
