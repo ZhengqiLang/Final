@@ -10,6 +10,17 @@ from core.jax_utils import lipschitz_coeff
 from core.plot import plot_dataset
 
 
+def range_from_raw(raw, eps=1e-3):
+    # raw: (N,2) or (...,2)
+    a = raw[..., 0]
+    b = raw[..., 1]
+    nmin = jax.nn.softplus(a) + eps
+    nmax = nmin + jax.nn.softplus(b) + eps
+    return nmin, nmax
+
+
+
+
 class Learner:
     '''
     Main learner class.
@@ -54,8 +65,8 @@ class Learner:
 
 
         self.local_n = 2035              # 每个基础点周围采样多少个邻域点
-        self.local_radius_max = 0.5      # 邻域半径
-        self.local_radius_min = 0.1    #领域小值
+        self.local_radius_max = 0.7      # 邻域半径
+        self.local_radius_min = 0.05    #领域小值
         self.local_weight_alpha = 20.0 # 距离权重衰减强度
         self.local_use_uniform = True  # 用均匀采样还是高斯采样        
 
@@ -152,7 +163,8 @@ class Learner:
                    counterexamples,
                    mesh_loss,
                    probability_bound,
-                   expDecr_multiplier
+                   expDecr_multiplier,
+                   Range_state
                    ):
         '''
         Perform one step of training the neural network.
@@ -233,7 +245,7 @@ class Learner:
         # Exclude samples from target set
         samples_decrease_bool_not_targetUnsafe = self.env.target_space.jax_not_contains(samples_decrease)
 
-        def loss_fun(certificate_params, policy_params):
+        def loss_fun(certificate_params, policy_params,range_params):
 
             # Small epsilon used in the initial/unsafe loss terms
             EPS_init = 0.1
@@ -262,6 +274,20 @@ class Learner:
             V_unsafe = jnp.ravel(V_state.apply_fn(certificate_params, samples_unsafe))
             V_target = jnp.ravel(V_state.apply_fn(certificate_params, samples_target))
             V_decrease = jnp.ravel(V_state.apply_fn(certificate_params, samples_decrease))
+            #compute nmin and n max
+            raw_range = Range_state.apply_fn(range_params, samples_decrease)  # (N,2)
+            nmin, nmax = range_from_raw(raw_range, eps=getattr(self, "range_eps", 1e-3))
+
+            range_reg_weight = getattr(self, "range_reg_weight", 1e-3)
+            nmax_cap = getattr(self, "range_nmax_cap", 1.0)
+
+            # 惩罚 nmax 太大 + nmin 太大；并且鼓励 nmin 不要无限趋近 0（可选）
+            loss_range_reg = range_reg_weight * (
+                jnp.mean(jnp.maximum(nmax - nmax_cap, 0.0) ** 2)
+                + jnp.mean(nmin ** 2) * 0.1
+)
+
+
 
             # Loss in each initial/unsafe state
             if self.exp_certificate:
@@ -405,9 +431,12 @@ class Learner:
             loss_min_init = jnp.maximum(0, jnp.min(V_target, axis=0) - jnp.min(V_init, axis=0))
             loss_min_unsafe = jnp.maximum(0, jnp.min(V_target, axis=0) - jnp.min(V_unsafe, axis=0))
             loss_aux = self.auxiliary_loss * (loss_min_target + loss_min_init + loss_min_unsafe)
+            range_loss_weight = getattr(self, "range_loss_weight", 1.0)
+            loss_range = 100*loss_range_reg
+            # loss_range = range_loss_weight * loss_range_reg
 
             # Define total loss
-            loss_total = loss_init + loss_unsafe + loss_nondec + loss_lipschitz + loss_aux
+            loss_total = loss_init + loss_unsafe + loss_nondec + loss_lipschitz + loss_aux+loss_range
 
             infos = {
                 '0. total': loss_total,
@@ -420,11 +449,16 @@ class Learner:
             if self.auxiliary_loss > 0:
                 infos['8. loss auxiliary'] = loss_aux
 
+            infos["6. loss_range"] = loss_range
+            infos["6.1 range_reg"] = loss_range_reg
+            infos["6.2 nmin_mean"] = jnp.mean(nmin)
+            infos["6.3 nmax_mean"] = jnp.mean(nmax)
+
             return loss_total, infos
 
         # Compute gradients
-        loss_grad_fun = jax.value_and_grad(loss_fun, argnums=(0, 1), has_aux=True)
-        (loss_val, infos), (V_grads, Policy_grads) = loss_grad_fun(V_state.params, Policy_state.params)
+        loss_grad_fun = jax.value_and_grad(loss_fun, argnums=(0, 1,2), has_aux=True)
+        (loss_val, infos), (V_grads, Policy_grads, Range_grads) = loss_grad_fun(V_state.params, Policy_state.params, Range_state.params)
 
         samples_in_batch = {
             'init': samples_init,
@@ -438,7 +472,7 @@ class Learner:
             'counterx_decrease': cx_bool_decrease
         }
 
-        return V_grads, Policy_grads, infos, key, samples_in_batch
+        return V_grads, Policy_grads, Range_grads, infos, key, samples_in_batch
 
     def debug_train_step(self, args, samples_in_batch, iteration):
         '''

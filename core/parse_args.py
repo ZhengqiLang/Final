@@ -174,6 +174,14 @@ def parse_arguments(linfty, datetime, cwd):
     parser.add_argument('--improved_softplus_lip', action=argparse.BooleanOptionalAction, default=False,
                         help="If True, use improved (local) Lipschitz constants for softplus in V (if False, "
                              "global constant of 1 is used); Can only be used without logRASMs enabled")
+    
+
+    ## Range Net Arguments
+    parser.add_argument("--range_lr", type=float, default=1e-4)
+    parser.add_argument("--range_loss_weight", type=float, default=1.0)
+    parser.add_argument("--range_eps", type=float, default=1e-3)
+    parser.add_argument("--range_reg_weight", type=float, default=1e-3)
+    parser.add_argument("--range_nmax_cap", type=float, default=1.0)  # 可按环境尺度调
 
     args = parser.parse_args()
 

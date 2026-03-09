@@ -190,6 +190,29 @@ if __name__ == "__main__":
     target = {'model': Policy_state, 'config': Policy_config}
     Policy_state = orbax_checkpointer.restore(checkpoint_path, item=target)['model']
 
+    from core.jax_utils import MLP, create_train_state
+
+    #Deifne RangeNet
+
+    Range_neurons = [args.neurons_per_layer] * args.hidden_layers + [2]
+    Range_acts = [jax.nn.relu] * args.hidden_layers + [None]
+    Range_model = MLP(Range_neurons, Range_acts)
+    dummy_x = jnp.zeros((1, env.state_dim))
+
+
+    key, range_key = jax.random.split(key)  # 或者 rng
+    Range_state = create_train_state(
+        model=Range_model,
+        act_funcs=Range_acts,
+        rng=range_key,
+        in_dim=env.state_dim,
+        learning_rate=args.range_lr if hasattr(args, "range_lr") else args.lr,
+        ema=0,
+    )
+
+
+
+
     # Define Learner
     learn = Learner(env, args=args)
 
@@ -251,17 +274,19 @@ if __name__ == "__main__":
             for k in range(num_batches):
 
                 # Main train step function: Defines one loss function for the provided batch of train data and minimizes it
-                V_grads, Policy_grads, infos, key, samples_in_batch = learn.train_step(
+                V_grads, Policy_grads,Range_grads ,infos, key, samples_in_batch = learn.train_step(
                     key=key,
                     V_state=V_state,
                     Policy_state=Policy_state,
                     counterexamples=counterx_buffer.data[:, :-1],
                     mesh_loss=args.mesh_loss,
                     probability_bound=args.probability_bound,
-                    expDecr_multiplier=args.expDecr_multiplier
+                    expDecr_multiplier=args.expDecr_multiplier,
+                    Range_state = Range_state
                 )
 
                 fail = True
+                Range_state = Range_state.apply_gradients(grads=Range_grads)
                 if np.isnan(infos['0. total']):
                     print('(!!!) Warning: The losses contained NaN values, which indicates most probably at an error in the learner module')
                     LOGG.add_info(key='status', value='loss_nan')
