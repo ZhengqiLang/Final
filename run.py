@@ -194,8 +194,8 @@ if __name__ == "__main__":
 
     #Deifne RangeNet
 
-    Range_neurons = [args.neurons_per_layer] * args.hidden_layers + [2]
-    Range_acts = [jax.nn.relu] * args.hidden_layers + [None]
+    Range_neurons = [args.neurons_per_layer] * 2 + [1]
+    Range_acts = [jax.nn.relu] *2 + [None]
     Range_model = MLP(Range_neurons, Range_acts)
     dummy_x = jnp.zeros((1, env.state_dim))
 
@@ -205,7 +205,7 @@ if __name__ == "__main__":
         model=Range_model,
         act_funcs=Range_acts,
         rng=range_key,
-        in_dim=env.state_dim,
+        in_dim=env.state_dim+1,
         learning_rate=args.range_lr if hasattr(args, "range_lr") else args.lr,
         ema=0,
     )

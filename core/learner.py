@@ -211,13 +211,20 @@ class Learner:
         base_sample_decrease = jnp.squeeze(base_sample_decrease, axis=0) 
 
 
+        center = base_sample_decrease
+        V_Center = jnp.ravel(V_state.apply_fn(V_state.params, center[None,:]))
 
-        def sample_neighbors(self, center, key):
+
+        # print("***********V_center***************",V_Center)
+
+
+
+        def sample_neighbors(self, center, key,n):
             offsets = jax.random.uniform(
                 key,
                 shape=(self.local_n, self.env.state_dim),
-                minval=-self.local_radius_min,
-                maxval=self.local_radius_max
+                minval=-n,
+                maxval=n
             )
             neighbors_only = center[None, :] + offsets                  # (local_n, state_dim)
             neighbors = jnp.concatenate([center[None, :], neighbors_only], axis=0)  # (local_n+1, state_dim)
@@ -225,27 +232,65 @@ class Learner:
             return neighbors, dists
         
 
-        samples_decrease,dists = sample_neighbors(self,center=base_sample_decrease,key=decrease_key)
 
-
-        # weights = self.local_radius/jnp.maximum(dists, 1e-3)
-        weights = jnp.where(
-                dists < 1e-6,
-                1.0,  
-                (self.local_radius_max-self.local_radius_min) / (jnp.maximum(dists-self.local_radius_min,1e-3))
-                                                                 
-            )
-        weights = jnp.clip(weights, a_min=0.0, a_max=100.0)
-        weights = weights / (jnp.sum(weights) + 1e-6)
-            
-
-
-
+        
 
         # Exclude samples from target set
-        samples_decrease_bool_not_targetUnsafe = self.env.target_space.jax_not_contains(samples_decrease)
+        
 
         def loss_fun(certificate_params, policy_params,range_params):
+
+
+
+            #compute center and N by neural network
+            V_center = jnp.ravel(V_state.apply_fn(certificate_params, center[None, :]))[0]
+            radius_input = jnp.concatenate([center, jnp.array([V_center])], axis=0)[None, :]
+            raw_n = Range_state.apply_fn(range_params, radius_input)
+            raw_n = raw_n[0, 0]
+            n = jax.nn.softplus(raw_n) + 1e-3
+            # raw_n = raw_n[0, 0]
+
+
+            samples_decrease,dists = sample_neighbors(self,center=base_sample_decrease,key=decrease_key,n=n)
+
+            # weights = self.local_radius/jnp.maximum(dists, 1e-3)
+            weights = jnp.where(
+                    dists < 1e-6,
+                    1.0,  
+                    (n*2) / (jnp.maximum(dists,1e-3))
+                                                                    
+                )
+            weights = jnp.clip(weights, a_min=0.0, a_max=100.0)
+            weights = weights / (jnp.sum(weights) + 1e-6)
+            samples_decrease_bool_not_targetUnsafe = self.env.target_space.jax_not_contains(samples_decrease)
+
+
+
+
+
+            # d = dists[1:]
+            # dmin = jnp.min(d)
+            # loss_range_reg =(n - jnp.max(dists)) ** 2+ ( dmin) ** 2
+
+           
+
+
+            # samples_decrease,dists = sample_neighbors(self,center=base_sample_decrease,key=decrease_key)
+
+            # # weights = self.local_radius/jnp.maximum(dists, 1e-3)
+            # weights = jnp.where(
+            #         dists < 1e-6,
+            #         1.0,  
+            #         (self.local_radius_max-self.local_radius_min) / (jnp.maximum(dists-self.local_radius_min,1e-3))
+                                                                    
+            #     )
+            # weights = jnp.clip(weights, a_min=0.0, a_max=100.0)
+            # weights = weights / (jnp.sum(weights) + 1e-6)
+            # loss_range_reg =(nmax - jnp.max(dists)) ** 2+ ( dmin - nmin) ** 2
+
+
+
+
 
             # Small epsilon used in the initial/unsafe loss terms
             EPS_init = 0.1
@@ -274,18 +319,27 @@ class Learner:
             V_unsafe = jnp.ravel(V_state.apply_fn(certificate_params, samples_unsafe))
             V_target = jnp.ravel(V_state.apply_fn(certificate_params, samples_target))
             V_decrease = jnp.ravel(V_state.apply_fn(certificate_params, samples_decrease))
+
+
+
+
+
+
             #compute nmin and n max
-            raw_range = Range_state.apply_fn(range_params, samples_decrease)  # (N,2)
-            nmin, nmax = range_from_raw(raw_range, eps=getattr(self, "range_eps", 1e-3))
+            # raw_range = Range_state.apply_fn(range_params, samples_decrease)  # (N,2)
+            # nmin, nmax = range_from_raw(raw_range, eps=getattr(self, "range_eps", 1e-3))
 
-            range_reg_weight = getattr(self, "range_reg_weight", 1e-3)
-            nmax_cap = getattr(self, "range_nmax_cap", 1.0)
+            # range_reg_weight = getattr(self, "range_reg_weight", 1e-3)
+            # nmax_cap = getattr(self, "range_nmax_cap", 1.0)
 
-            # 惩罚 nmax 太大 + nmin 太大；并且鼓励 nmin 不要无限趋近 0（可选）
-            loss_range_reg = range_reg_weight * (
-                jnp.mean(jnp.maximum(nmax - nmax_cap, 0.0) ** 2)
-                + jnp.mean(nmin ** 2) * 0.1
-)
+            # # 惩罚 nmax 太大 + nmin 太大；并且鼓励 nmin 不要无限趋近 0（可选）
+            # nmin0 = nmin[0]
+            # nmax0 = nmax[0]
+            # d = dists[1:]
+            # dmin = jnp.min(d)
+
+            # loss_range_reg =(nmax - jnp.max(dists)) ** 2+ ( dmin - nmin) ** 2
+
 
 
 
@@ -298,7 +352,10 @@ class Learner:
                 losses_unsafe = jnp.maximum(0, 1 / (1 - probability_bound) - V_unsafe + EPS_unsafe)
 
             # Loss for expected decrease condition
-            expDecr_keys = jax.random.split(noise_key, (self.num_samples_decrease, self.N_expectation))
+            # ????
+            N = samples_decrease.shape[0]
+            expDecr_keys = jax.random.split(noise_key, (N, self.N_expectation))
+            #?????
             actions = Policy_state.apply_fn(policy_params, samples_decrease)
             V_expected = self.loss_exp_decrease_vmap(V_state, certificate_params, samples_decrease, actions,
                                                      expDecr_keys, probability_bound)
@@ -431,12 +488,12 @@ class Learner:
             loss_min_init = jnp.maximum(0, jnp.min(V_target, axis=0) - jnp.min(V_init, axis=0))
             loss_min_unsafe = jnp.maximum(0, jnp.min(V_target, axis=0) - jnp.min(V_unsafe, axis=0))
             loss_aux = self.auxiliary_loss * (loss_min_target + loss_min_init + loss_min_unsafe)
-            range_loss_weight = getattr(self, "range_loss_weight", 1.0)
-            loss_range = 100*loss_range_reg
+            # range_loss_weight = getattr(self, "range_loss_weight", 1.0)
+            # loss_range = 100000*loss_range_reg
             # loss_range = range_loss_weight * loss_range_reg
 
             # Define total loss
-            loss_total = loss_init + loss_unsafe + loss_nondec + loss_lipschitz + loss_aux+loss_range
+            loss_total = loss_init + loss_unsafe + loss_nondec + loss_lipschitz + loss_aux
 
             infos = {
                 '0. total': loss_total,
@@ -448,24 +505,37 @@ class Learner:
 
             if self.auxiliary_loss > 0:
                 infos['8. loss auxiliary'] = loss_aux
+            infos["9. n"] = n
+            infos["9.1 mean_dist"] = jnp.mean(dists)
+            infos["9.2 max_dist"] = jnp.max(dists)
+            infos["9.3 max_weight"] = jnp.max(weights)
 
-            infos["6. loss_range"] = loss_range
-            infos["6.1 range_reg"] = loss_range_reg
-            infos["6.2 nmin_mean"] = jnp.mean(nmin)
-            infos["6.3 nmax_mean"] = jnp.mean(nmax)
+            # infos["6. loss_range"] = loss_range
+            # infos["6.1 range_reg"] = loss_range_reg
+            # infos["6.2 nmin_mean"] = jnp.mean(nmin)
+            # infos["6.3 nmax_mean"] = jnp.mean(nmax)
 
             return loss_total, infos
 
         # Compute gradients
         loss_grad_fun = jax.value_and_grad(loss_fun, argnums=(0, 1,2), has_aux=True)
         (loss_val, infos), (V_grads, Policy_grads, Range_grads) = loss_grad_fun(V_state.params, Policy_state.params, Range_state.params)
+        # 重新计算当前参数下的 center / n / samples_decrease，仅用于记录
+        V_center_log = jnp.ravel(V_state.apply_fn(V_state.params, center[None, :]))[0]
+        range_input_log = jnp.concatenate([center, jnp.array([V_center_log])], axis=0)[None, :]
+        raw_n_log = Range_state.apply_fn(Range_state.params, range_input_log)[0, 0]
+        n_log = jax.nn.softplus(raw_n_log) + 1e-3
 
+        samples_decrease_log, dists_log = sample_neighbors(
+            self, center=base_sample_decrease, key=decrease_key, n=n_log
+        )
+        samples_decrease_bool_not_targetUnsafe_log = self.env.target_space.jax_not_contains(samples_decrease_log)
         samples_in_batch = {
             'init': samples_init,
             'target': samples_target,
             'unsafe': samples_unsafe,
-            'decrease': samples_decrease,
-            'decrease_not_in_target': samples_decrease_bool_not_targetUnsafe,
+            'decrease': samples_decrease_log,
+            'decrease_not_in_target': samples_decrease_bool_not_targetUnsafe_log,
             'counterx': cx_samples,
             'counterx_init': cx_bool_init,
             'counterx_unsafe': cx_bool_unsafe,
